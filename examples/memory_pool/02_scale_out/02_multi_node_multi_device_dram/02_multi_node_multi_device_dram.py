@@ -21,7 +21,7 @@ ONE_GIB = 1 << 30  # 1GB
 COPY_BYTES = 4 * 1024 * 1024  # 4MB
 WORLD_SIZE = 2
 
-# After join, give rank 0 time to finish H2G before rank 1 reads peer (no barrier).
+DATA_OP_TYPE = bm.BmDataOpType.SDMA
 POST_JOIN_RANK1_SLEEP_SEC = 3.0
 
 
@@ -42,7 +42,7 @@ def _run_rank0(head_node_ip: str) -> None:
             id=0,
             local_dram_size=ONE_GIB,
             max_dram_size=ONE_GIB,
-            data_op_type=bm.BmDataOpType.DEVICE_RDMA,
+            data_op_type=DATA_OP_TYPE,
         )
         print(f"[rank 0] join() (store={store_url}) — may return before rank 1 starts", flush=True)
         assert handle.join() == 0, "join failed"
@@ -88,7 +88,7 @@ def _run_rank1(head_node_ip: str) -> None:
             id=0,
             local_dram_size=ONE_GIB,
             max_dram_size=ONE_GIB,
-            data_op_type=bm.BmDataOpType.DEVICE_RDMA,
+            data_op_type=DATA_OP_TYPE,
         )
         print(f"[rank 1] joining (store={store_url})", flush=True)
         assert handle.join() == 0, "join failed"
@@ -105,9 +105,9 @@ def _run_rank1(head_node_ip: str) -> None:
         ), "H2G host to global pool"
 
         exp = torch.arange(COPY_BYTES // 4, dtype=torch.int32).contiguous()
-        got = torch.empty(COPY_BYTES // 4, dtype=torch.int32)
+        got = torch.empty(COPY_BYTES // 4, dtype=torch.int32, device="npu")
         assert (
-            handle.copy_data(gva_peer0, got.data_ptr(), COPY_BYTES, bm.BmCopyType.G2H, 0) == 0
+            handle.copy_data(gva_peer0, got.data_ptr(), COPY_BYTES, bm.BmCopyType.G2L, 1<<1) == 0
         ), "G2H global pool to host"
         assert torch.equal(got, exp), "data mismatch"
 
