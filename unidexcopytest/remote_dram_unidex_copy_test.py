@@ -47,10 +47,6 @@ def _hex(value: int) -> str:
     return f"0x{int(value):x}"
 
 
-def _stream_ptr():
-    return torch.npu.current_stream().npu_stream
-
-
 def _load_unidex_copy_inplace():
     try:
         from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
@@ -206,7 +202,6 @@ def _run_rank0(args: argparse.Namespace) -> None:
             total_bytes,
             bm.BmCopyType.L2GH,
             COPY_EXTEND_FLAG,
-            _stream_ptr(),
         )
         assert ret == 0, f"L2GH offload failed, ret={ret}, err={mf.get_last_err_msg()}"
         torch.npu.current_stream().synchronize()
