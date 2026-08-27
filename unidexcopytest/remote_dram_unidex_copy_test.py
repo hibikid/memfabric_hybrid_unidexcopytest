@@ -257,7 +257,6 @@ def _run_rank1(args: argparse.Namespace) -> None:
             src_address_ndims=SRC_ADDRESS_NDIMS,
             dst_address_ndims=DST_ADDRESS_NDIMS,
             block_dim=args.block_dim,
-            sync=True,
             src_ptr=src_lva,
         )
         torch.npu.synchronize()
