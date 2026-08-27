@@ -47,6 +47,10 @@ def _hex(value: int) -> str:
     return f"0x{int(value):x}"
 
 
+def _arange_on_device(end: int, dtype: torch.dtype, device: str | torch.device) -> torch.Tensor:
+    return torch.arange(end, dtype=dtype).to(device)
+
+
 def _load_unidex_copy_inplace():
     try:
         from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
@@ -71,8 +75,8 @@ def _load_unidex_copy_inplace():
 
 def _build_rank0_kv(device: str) -> torch.Tensor:
     src = torch.empty(SRC_SHAPE, dtype=DTYPE, device=device).contiguous()
-    seq = torch.arange(SRC_SEQ, dtype=torch.float32, device=device).reshape(SRC_SEQ, 1, 1)
-    dim = torch.arange(HEAD_DIM, dtype=torch.float32, device=device).remainder(8).reshape(1, 1, HEAD_DIM)
+    seq = _arange_on_device(SRC_SEQ, torch.float32, device).reshape(SRC_SEQ, 1, 1)
+    dim = _arange_on_device(HEAD_DIM, torch.float32, device).remainder(8).reshape(1, 1, HEAD_DIM)
 
     with torch.no_grad():
         for batch_id in range(BATCH):
@@ -84,31 +88,63 @@ def _build_rank0_kv(device: str) -> torch.Tensor:
 
 
 def _build_topk_indices(device: str, seed: int, unique_topk: bool) -> torch.Tensor:
-    torch.manual_seed(seed)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
     if not unique_topk:
-        return torch.randint(0, SRC_SEQ, (BATCH, TOPK), dtype=torch.long, device=device).contiguous()
+        topk_cpu = torch.randint(0, SRC_SEQ, (BATCH, TOPK), dtype=torch.long, generator=generator)
+        return topk_cpu.to(device).contiguous()
 
     rows = [
-        torch.randperm(SRC_SEQ, dtype=torch.long, device=device)[:TOPK]
+        torch.randperm(SRC_SEQ, dtype=torch.long, generator=generator)[:TOPK]
         for _ in range(BATCH)
     ]
-    return torch.stack(rows, dim=0).contiguous()
+    return torch.stack(rows, dim=0).to(device).contiguous()
 
 
 def _build_unidex_indices(topk_indices: torch.Tensor):
     device = topk_indices.device
-    batch_offsets = torch.arange(BATCH, dtype=torch.long, device=device).reshape(BATCH, 1) * SRC_SEQ
+    batch_offsets = _arange_on_device(BATCH, torch.long, device).reshape(BATCH, 1) * SRC_SEQ
     src_index = (batch_offsets + topk_indices).reshape(-1).contiguous()
-    dst_index = torch.arange(BATCH * TOPK, dtype=torch.long, device=device).contiguous()
+    dst_index = _arange_on_device(BATCH * TOPK, torch.long, device).contiguous()
     valid_mask = ((topk_indices >= 0) & (topk_indices < SRC_SEQ)).reshape(-1).contiguous()
     return src_index, dst_index, valid_mask
 
 
 def _build_expected(topk_indices: torch.Tensor, device: str) -> torch.Tensor:
-    batch = torch.arange(BATCH, dtype=torch.float32, device=device).reshape(BATCH, 1, 1, 1)
-    dim = torch.arange(HEAD_DIM, dtype=torch.float32, device=device).remainder(8).reshape(1, 1, 1, HEAD_DIM)
+    batch = _arange_on_device(BATCH, torch.float32, device).reshape(BATCH, 1, 1, 1)
+    dim = _arange_on_device(HEAD_DIM, torch.float32, device).remainder(8).reshape(1, 1, 1, HEAD_DIM)
     token = topk_indices.to(torch.float32).reshape(BATCH, TOPK, 1, 1)
     return ((batch * 17 + token).remainder(64) + dim).to(DTYPE).contiguous()
+
+
+def _dump_first_batch_topk(
+    topk_indices: torch.Tensor,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    count: int,
+    head_dims: int,
+) -> None:
+    count = min(max(int(count), 0), TOPK)
+    head_dims = min(max(int(head_dims), 1), HEAD_DIM)
+    if count == 0:
+        return
+
+    first_batch_indices = topk_indices[0, :count].cpu().tolist()
+    actual_rows = actual[0, :count, 0, :head_dims].to(torch.float32).cpu().tolist()
+    expected_rows = expected[0, :count, 0, :head_dims].to(torch.float32).cpu().tolist()
+    row_matches = actual[0, :count].eq(expected[0, :count]).reshape(count, -1).all(dim=1).cpu().tolist()
+
+    print(
+        f"[rank 1] first batch first {count} topk rows "
+        f"(showing first {head_dims}/{HEAD_DIM} dims)",
+        flush=True,
+    )
+    for pos, token_idx in enumerate(first_batch_indices):
+        print(
+            f"  topk_pos={pos}, token_idx={int(token_idx)}, match={bool(row_matches[pos])}, "
+            f"actual={actual_rows[pos]}, expected={expected_rows[pos]}",
+            flush=True,
+        )
 
 
 def _make_src_meta_tensor(device_kind: str) -> torch.Tensor:
@@ -263,6 +299,13 @@ def _run_rank1(args: argparse.Namespace) -> None:
 
         if not args.skip_verify:
             expected = _build_expected(topk_indices, args.device)
+            _dump_first_batch_topk(
+                topk_indices,
+                dst,
+                expected,
+                args.dump_first_batch_topk,
+                args.dump_head_dims,
+            )
             _assert_equal(dst, expected)
 
         print("[rank 1] UniDex remote DRAM sparse copy OK", flush=True)
@@ -287,6 +330,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--post-join-sleep-sec", type=float, default=POST_JOIN_RANK1_SLEEP_SEC)
     parser.add_argument("--rank0-hold-sec", type=float, default=0.0)
     parser.add_argument("--src-meta-device", choices=("cpu", "meta"), default="cpu")
+    parser.add_argument("--dump-first-batch-topk", type=int, default=16)
+    parser.add_argument("--dump-head-dims", type=int, default=16)
     parser.add_argument("--unique-topk", action="store_true")
     parser.add_argument("--skip-verify", action="store_true")
     args = parser.parse_args()
